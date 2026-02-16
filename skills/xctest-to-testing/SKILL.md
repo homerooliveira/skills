@@ -1,11 +1,11 @@
 ---
-name: xctest-to-testing-migrator
+name: xctest-to-testing
 description: Migrates XCTest code to Swift Testing framework. Use this skill when converting existing XCTest tests to the newer Swift Testing framework.
 metadata:
   short-description: Migrate XCTest tests to Swift Testing with struct-first defaults
 ---
 
-# XCTest to Swift Testing Migrator
+# XCTest to Swift Testing
 
 ## Scope and Preconditions
 

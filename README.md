@@ -21,14 +21,14 @@ cp -R <skills-repo>/skills/* <target-repo>/.agents/skills/
 Prompt invocation example:
 
 ```text
-Use $xctest-to-testing-migrator to convert this XCTest suite to Swift Testing.
+Use $xctest-to-testing to convert this XCTest suite to Swift Testing.
 ```
 
 ## Skills
 
-### `xctest-to-testing-migrator`
+### `xctest-to-testing`
 
-- Path: `skills/xctest-to-testing-migrator`
+- Path: `skills/xctest-to-testing`
 - Overview: Migrates XCTest-based tests to Swift Testing with struct-first defaults, assertion mapping guidance, lifecycle migration rules, and unsupported-feature fallback guidance.
 
 ## Sync Between Repos (Manual)

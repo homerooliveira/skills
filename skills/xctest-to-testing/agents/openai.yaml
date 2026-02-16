@@ -1,0 +1,4 @@
+interface:
+  display_name: "XCTest to Testing"
+  short_description: "Migrate XCTest suites to Swift Testing"
+  default_prompt: "Use $xctest-to-testing to migrate this XCTest file to Swift Testing with minimal churn."
