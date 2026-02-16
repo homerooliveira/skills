@@ -1,38 +1,44 @@
 ---
 name: xctest-to-testing
-description: Migrates XCTest code to Swift Testing framework. Use this skill when converting existing XCTest tests to the newer Swift Testing framework.
-metadata:
-  short-description: Migrate XCTest tests to Swift Testing with struct-first defaults
+description: Migrate XCTest-based Swift tests to Swift Testing incrementally. Use when converting XCTestCase suites, assertions, setup/teardown, expectations/callback tests, skip logic, known issues, serialized execution, and attachments to `Testing` APIs.
 ---
 
 # XCTest to Swift Testing
 
 ## Scope and Preconditions
 
-This skill is for migrating existing XCTest tests to Swift Testing in incremental steps.
+Use this skill to migrate existing XCTest tests to Swift Testing with minimal churn.
 
-- Output is guidance and edits only. This skill does not include an automatic rewrite script.
-- XCTest and Swift Testing can coexist in the same package during migration.
+- Provide guidance and edits only. Do not assume an automatic rewrite script.
+- Allow XCTest and Swift Testing to coexist during migration.
 - Keep migrations target-by-target or file-by-file to reduce risk.
 
 Before migrating:
 
 - Confirm the project builds and tests pass in baseline state.
-- Inventory XCTest-only features in the target file (`XCTestExpectation`, `measure`, heavy `XCTestCase` lifecycle usage).
+- Inventory XCTest-only features in the target file (`XCTestExpectation`, `XCTSkip*`, `XCTExpectFailure`, `measure`, heavy `XCTestCase` lifecycle usage).
 - Pick the destination test type using the rules in `Struct-First Defaults`.
 
 ## Struct-First Defaults
 
-Use this default unless one of the exceptions below applies.
+Use struct-based suites by default.
 
 - Default target shape:
   - `import Testing`
   - `struct MyTests { ... }`
   - `@Test` for each test function
 - Keep as `class` when:
-  - you must preserve class inheritance patterns used by shared base test classes,
-  - you need `deinit` cleanup semantics directly on the test container,
-  - or migration scope is intentionally minimal and retaining class form reduces churn.
+  - Preserve class inheritance from shared base test classes.
+  - Preserve cleanup that must run in `deinit`.
+  - Reduce migration churn intentionally in a narrow scope.
+- Import both `XCTest` and `Testing` when a file intentionally contains mixed tests.
+
+## Execution Model and Actor Isolation
+
+- Assume migrated tests run on an arbitrary task, not on the main actor by default.
+- Add `@MainActor` when test logic must run on the main thread.
+- Use `await MainActor.run { ... }` for small thread-sensitive regions.
+- Prefer explicit isolation over relying on XCTest's historical synchronous-main-thread behavior.
 
 ## Assertion Transformations
 
@@ -51,13 +57,22 @@ Use this default unless one of the exceptions below applies.
 | `XCTAssertGreaterThanOrEqual(a, b)` | `#expect(a >= b)` | |
 | `XCTAssertLessThan(a, b)` | `#expect(a < b)` | |
 | `XCTAssertLessThanOrEqual(a, b)` | `#expect(a <= b)` | |
+| `XCTAssertThrowsError(try f())` | `#expect(throws: (any Error).self) { try f() }` | Capture and inspect the error when needed. |
+| `XCTAssertNoThrow(try f())` | `#expect(throws: Never.self) { try f() }` | |
 | `try XCTUnwrap(optional)` | `try #require(optional)` | |
-| `XCTFail("message")` | `Issue.record("message")` | Use when control flow hits an impossible path. |
+| `XCTFail("message")` | `Issue.record("message")` | If used inside async/network test doubles, also propagate a failure result to avoid hanging callbacks. |
 
 Message handling:
 
 - Preserve assertion intent first. Keep custom reason strings where they improve failure triage.
 - Do not mechanically carry `file:`/`line:` parameters; Swift Testing captures source context.
+- Do not force-translate `XCTAssertEqual(..., accuracy: ...)`; use an approximate comparison helper (for example, `isApproximatelyEqual` from `swift-numerics`) when needed.
+
+## Failure Semantics (`continueAfterFailure`)
+
+- Do not migrate `continueAfterFailure = false` directly.
+- Use `try #require(...)` for gate conditions that should stop the current test early.
+- Keep using `#expect(...)` for checks that should record failures but allow the test to continue.
 
 ## Error Handling Patterns
 
@@ -99,6 +114,58 @@ Guidance:
 - Re-throw unknown error types so the test fails with useful context.
 - Reserve `Issue.record(...)` for impossible branches or extra diagnostics.
 
+## Async Callback Migration (Important)
+
+Use the following rule:
+
+- Use `await confirmation(...)` for event-style APIs where the callback should occur before the confirmation scope returns.
+- Use continuations for callback-driven APIs that complete later (for example, `URLSession` or queue-delivered callbacks).
+
+Key semantics of `confirmation(...)`:
+
+- Expect one confirmation by default.
+- Pass `expectedCount:` to require exact counts.
+- Pass a lower-bounded range (for example, `10...`) when over-fulfill is acceptable but a minimum is required.
+- Ensure confirmations happen before the confirmation closure returns.
+
+Use this pattern:
+
+```swift
+let value = await withCheckedContinuation { continuation in
+    service.load { result in
+        continuation.resume(returning: result)
+    }
+}
+#expect(value.isSuccess)
+```
+
+XCTest-to-Continuation example:
+
+```swift
+// Before (XCTest)
+func testFetchUsers() {
+    let expectation = XCTestExpectation(description: "fetch users")
+    service.fetchUsers { result in
+        XCTAssertNotNil(result.value)
+        expectation.fulfill()
+    }
+    wait(for: [expectation], timeout: 1)
+}
+
+// After (Swift Testing)
+@Test
+func fetchUsers() async {
+    let result = await withCheckedContinuation { continuation in
+        service.fetchUsers { result in
+            continuation.resume(returning: result)
+        }
+    }
+    #expect(result.value != nil)
+}
+```
+
+Use `withCheckedThrowingContinuation` when the callback carries throwing semantics.
+
 ## Lifecycle and Test Structure Migration
 
 | XCTest pattern | Swift Testing target | Notes |
@@ -116,6 +183,20 @@ Important:
 
 - Do not blindly map `tearDown` to `deinit` for struct suites. Structs do not support `deinit`.
 - If cleanup must run when test container is destroyed, keep class-based tests and use `deinit` there.
+
+## Skip and Conditional Execution Migration
+
+Convert runtime skip calls to traits:
+
+| XCTest | Swift Testing |
+|--------|---------------|
+| `try XCTSkipIf(condition)` | `@Test(.enabled(if: !condition))` or `@Suite(.disabled(if: condition))` |
+| `try XCTSkipUnless(condition)` | `@Test(.enabled(if: condition))` |
+
+Guidance:
+
+- Prefer suite-level traits when the condition applies to all tests in a container.
+- Prefer test-level traits when only one test is conditional.
 
 ## Struct-Based State Management
 
@@ -166,6 +247,18 @@ struct CommandTests {
 }
 ```
 
+## Known-Issue Migration
+
+Convert `XCTExpectFailure` blocks to `withKnownIssue`.
+
+| XCTest | Swift Testing |
+|--------|---------------|
+| `XCTExpectFailure("msg") { ... }` | `withKnownIssue("msg") { ... }` |
+| `XCTExpectFailure(..., options: .nonStrict()) { ... }` | `withKnownIssue(..., isIntermittent: true) { ... }` |
+
+Use overloads with `when:` and `matching:` to replace option-based conditional matching.
+- For `XCTExpectFailure(_:options:)` that affects the remainder of a test, wrap the intended scope explicitly in `withKnownIssue { ... }`.
+
 ## Parameterized Tests with `@Test(arguments:)`
 
 Convert loop-based case tables when it improves readability and reporting.
@@ -192,15 +285,35 @@ Avoid parameterization when:
 - each case needs different setup/teardown shape,
 - or each case has different multi-step assertions.
 
+## Suite Parallelism and Serialization
+
+- Assume Swift Testing runs tests in a suite in parallel by default.
+- Add `@Suite(.serialized)` for suites that cannot be made concurrency-safe yet.
+- Prefer refactoring shared mutable state over blanket serialization.
+
+## Attachment Migration
+
+| XCTest | Swift Testing |
+|--------|---------------|
+| `XCTAttachment(...)` + `add(...)` | `Attachment.record(...)` |
+
+Guidance:
+
+- Attach values that help diagnose failures.
+- Prefer types that already conform to `Attachable`, `Encodable`, or `NSSecureCoding` (with Foundation imported).
+- Add custom byte serialization only when default attachment behavior is insufficient.
+
 ## Unsupported or Manual Migration Matrix
 
 | XCTest feature | Swift Testing status | Recommended migration action |
 |----------------|----------------------|------------------------------|
-| `XCTestExpectation` / `waitForExpectations` | No direct 1:1 replacement pattern | Refactor around `async` APIs where possible. Keep XCTest temporarily if refactor is high-risk. |
+| `XCTestExpectation` / `waitForExpectations` | Partial mapping via `confirmation` + async refactors | Use `confirmation` for scoped event confirmation; use continuations for deferred callback completion. Keep XCTest temporarily if refactor is high-risk. |
 | `measure {}` performance tests | XCTest-specific | Keep as XCTest or move to dedicated benchmarking tooling. |
+| `XCTExpectFailure(_:options:)` without closure | No direct 1:1 scope-wide equivalent | Wrap the affected region (or full test body) in `withKnownIssue { ... }`. |
 | Heavy `XCTestCase` lifecycle coupling | Partial | Prefer helper factories and local cleanup. Keep class form if needed. |
 | `tearDownWithError` behavior with strict guarantees | No direct struct equivalent | Manual migration required. Consider class-based suite retention. |
 | Test ordering dependencies | Discouraged in both frameworks | Refactor tests to be order-independent before migration. |
+| Shared global test doubles (`static var` handlers) | High flake risk under concurrent execution | Isolate access with a single serialization mechanism (actor/lock) and keep setup+await+teardown in one scoped helper. |
 
 ## Deterministic Migration Workflow
 
@@ -211,8 +324,10 @@ Avoid parameterization when:
 5. Replace assertions using the transformation table.
 6. Migrate throwing assertions with typed `#expect` patterns.
 7. Convert simple looped case tables to `@Test(arguments:)` where useful.
-8. Resolve unsupported XCTest features using the `Unsupported or Manual Migration Matrix`.
-9. Run verification commands and fix any regression.
+8. Migrate skip conditions and known-issue blocks to traits / `withKnownIssue`.
+9. Add `@Suite(.serialized)` only where shared state cannot yet be isolated.
+10. Resolve unsupported XCTest features using the `Unsupported or Manual Migration Matrix`.
+11. Run verification commands and fix any regression.
 
 Stop conditions:
 
@@ -240,13 +355,19 @@ swift test --filter <TargetName>
 
 4. Check for leftover XCTest usage intentionally or accidentally:
 ```bash
-rg -n "import XCTest|XCTestCase|XCTAssert|XCTFail|XCTUnwrap|XCTestExpectation|measure\\(" Tests
+rg -n "import XCTest|XCTestCase|XCTAssert|XCTFail|XCTUnwrap|XCTestExpectation|XCTSkip|XCTExpectFailure|XCTAttachment|measure\\(" Tests
+```
+
+For Xcode projects (non-SPM), also run:
+
+```bash
+xcodebuild -project <Project>.xcodeproj -scheme <Scheme> -destination 'platform=iOS Simulator,name=<Device>' test
 ```
 
 Expected output behavior in mixed state:
 
 - XCTest output: `Test Suite` / `Test Case` lines.
-- Swift Testing output: `◇` start markers and `✔` pass lines.
+- Swift Testing output: `◇` start markers and `✔` pass lines.q
 - Both outputs together are valid during incremental migration.
 
 Common migration failures and fixes:
@@ -255,3 +376,5 @@ Common migration failures and fixes:
 - Mutation errors in struct tests: add `mutating` only where needed.
 - Capture-before-initialization errors: use helper reference types for closure-captured mutable state.
 - Incorrect lifecycle mapping: remove struct `deinit` assumptions and use local cleanup strategies.
+- Main-thread-only failures: add `@MainActor` or `MainActor.run` around thread-sensitive logic.
+- Lost callback assertions: replace ad-hoc async callbacks with `confirmation` or continuations based on callback timing.
